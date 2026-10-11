@@ -31,9 +31,14 @@ public class BookingServiceImpl implements BookingService {
 
     @Override
     public Optional<Hold> hold(String clientId, Set<Seat> seats) {
-        Set<Seat> copy = validateRequest(clientId, seats);
-        int[] indices = indices(copy);
-        enter(null);
+        Set<Seat> copy = Set.copyOf(Objects.requireNonNull(seats, "seats"));
+        int[] indices = prepareSeats(clientId, copy);
+        synchronized (lifecycle) {
+            if (stopped) {
+                throw new IllegalStateException("Booking service is stopped");
+            }
+            activeCalls++;
+        }
         try {
             return withSeats(indices, 0, () -> {
                 Instant now = Instant.now();
@@ -45,23 +50,39 @@ public class BookingServiceImpl implements BookingService {
                 return Optional.of(createHold(clientId, copy, indices, now));
             });
         } finally {
-            leave(null);
+            synchronized (lifecycle) {
+                if (--activeCalls == 0) {
+                    lifecycle.notifyAll();
+                }
+            }
         }
     }
 
     @Override
     public Optional<Hold> holdOrWait(String clientId, Set<Seat> seats, Duration timeout)
             throws InterruptedException {
-        Set<Seat> copy = validateRequest(clientId, seats);
+        Set<Seat> copy = Set.copyOf(Objects.requireNonNull(seats, "seats"));
+        int[] indices = prepareSeats(clientId, copy);
         Objects.requireNonNull(timeout, "timeout");
         if (timeout.isNegative()) {
             throw new IllegalArgumentException("timeout must not be negative");
         }
-        int[] indices = indices(copy);
         Waiter waiter = new Waiter();
-        enter(waiter);
+        long timeoutNanos;
+        try {
+            timeoutNanos = timeout.toNanos();
+        } catch (ArithmeticException e) {
+            timeoutNanos = Long.MAX_VALUE;
+        }
+        final long budget = timeoutNanos;
+        synchronized (lifecycle) {
+            if (stopped) {
+                throw new IllegalStateException("Booking service is stopped");
+            }
+            activeCalls++;
+            waiters.add(waiter);
+        }
         long started = System.nanoTime();
-        long budget = nanos(timeout);
         try {
             boolean firstAttempt = true;
             while (true) {
@@ -87,7 +108,13 @@ public class BookingServiceImpl implements BookingService {
                         }
                         if (status == SeatStatus.HELD) {
                             free = false;
-                            delay = Math.min(delay, nanos(Duration.between(now, state.hold.expiresAt())));
+                            long untilExpiration;
+                            try {
+                                untilExpiration = Duration.between(now, state.hold.expiresAt()).toNanos();
+                            } catch (ArithmeticException e) {
+                                untilExpiration = Long.MAX_VALUE;
+                            }
+                            delay = Math.min(delay, untilExpiration);
                         }
                     }
                     if (free) {
@@ -120,7 +147,10 @@ public class BookingServiceImpl implements BookingService {
                 }
                 synchronized (waiter) {
                     if (!waiter.signalled && !stopped) {
-                        timedWait(waiter, attempt.wakeAt - System.nanoTime());
+                        long remaining = attempt.wakeAt - System.nanoTime();
+                        if (remaining > 0) {
+                            waiter.wait(remaining / 1_000_000, (int) (remaining % 1_000_000));
+                        }
                     }
                 }
                 firstAttempt = false;
@@ -138,25 +168,25 @@ public class BookingServiceImpl implements BookingService {
                 }
                 return null;
             });
-            leave(waiter);
+            synchronized (lifecycle) {
+                waiters.remove(waiter);
+                if (--activeCalls == 0) {
+                    lifecycle.notifyAll();
+                }
+            }
         }
     }
 
     @Override
     public boolean confirm(Hold hold) {
-        return finish(hold, true);
-    }
-
-    @Override
-    public boolean release(Hold hold) {
-        return finish(hold, false);
-    }
-
-    private boolean finish(Hold hold, boolean sell) {
         Objects.requireNonNull(hold, "hold");
-        Set<Seat> copy = validateRequest(hold.clientId(), hold.seats());
-        int[] indices = indices(copy);
-        enter(null);
+        int[] indices = prepareSeats(hold.clientId(), hold.seats());
+        synchronized (lifecycle) {
+            if (stopped) {
+                throw new IllegalStateException("Booking service is stopped");
+            }
+            activeCalls++;
+        }
         try {
             return withSeats(indices, 0, () -> {
                 if (!Instant.now().isBefore(hold.expiresAt())) {
@@ -170,19 +200,71 @@ public class BookingServiceImpl implements BookingService {
                 for (int index : indices) {
                     SeatState state = states[index];
                     state.hold = null;
-                    state.sold = sell;
-                    state.signalWaiters();
+                    state.sold = true;
+                    if (state.waiters != null) {
+                        for (Waiter waiter : state.waiters) {
+                            waiter.signal();
+                        }
+                    }
                 }
                 return true;
             });
         } finally {
-            leave(null);
+            synchronized (lifecycle) {
+                if (--activeCalls == 0) {
+                    lifecycle.notifyAll();
+                }
+            }
+        }
+    }
+
+    @Override
+    public boolean release(Hold hold) {
+        Objects.requireNonNull(hold, "hold");
+        int[] indices = prepareSeats(hold.clientId(), hold.seats());
+        synchronized (lifecycle) {
+            if (stopped) {
+                throw new IllegalStateException("Booking service is stopped");
+            }
+            activeCalls++;
+        }
+        try {
+            return withSeats(indices, 0, () -> {
+                if (!Instant.now().isBefore(hold.expiresAt())) {
+                    return false;
+                }
+                for (int index : indices) {
+                    if (states[index].hold != hold || states[index].sold) {
+                        return false;
+                    }
+                }
+                for (int index : indices) {
+                    SeatState state = states[index];
+                    state.hold = null;
+                    if (state.waiters != null) {
+                        for (Waiter waiter : state.waiters) {
+                            waiter.signal();
+                        }
+                    }
+                }
+                return true;
+            });
+        } finally {
+            synchronized (lifecycle) {
+                if (--activeCalls == 0) {
+                    lifecycle.notifyAll();
+                }
+            }
         }
     }
 
     @Override
     public SeatStatus status(Seat seat) {
-        int index = index(seat);
+        Objects.requireNonNull(seat, "seat");
+        if (!hall.contains(seat)) {
+            throw new IllegalArgumentException("Seat is outside the hall: " + seat);
+        }
+        int index = (seat.row() - 1) * hall.seatsPerRow() + seat.number() - 1;
         synchronized (states[index]) {
             return states[index].status(Instant.now());
         }
@@ -227,31 +309,18 @@ public class BookingServiceImpl implements BookingService {
         return hold;
     }
 
-    private Set<Seat> validateRequest(String clientId, Set<Seat> seats) {
+    private int[] prepareSeats(String clientId, Set<Seat> seats) {
         Objects.requireNonNull(clientId, "clientId");
-        Set<Seat> copy = Set.copyOf(Objects.requireNonNull(seats, "seats"));
-        if (clientId.isBlank() || copy.isEmpty() || copy.size() > MAX_SEATS_PER_HOLD) {
+        if (clientId.isBlank() || seats.isEmpty() || seats.size() > MAX_SEATS_PER_HOLD) {
             throw new IllegalArgumentException("Expected a client and 1-10 seats");
         }
-        for (Seat seat : copy) {
-            index(seat);
-        }
-        return copy;
-    }
-
-    private int index(Seat seat) {
-        Objects.requireNonNull(seat, "seat");
-        if (!hall.contains(seat)) {
-            throw new IllegalArgumentException("Seat is outside the hall: " + seat);
-        }
-        return (seat.row() - 1) * hall.seatsPerRow() + seat.number() - 1;
-    }
-
-    private int[] indices(Set<Seat> seats) {
         int[] result = new int[seats.size()];
         int offset = 0;
         for (Seat seat : seats) {
-            result[offset++] = index(seat);
+            if (!hall.contains(seat)) {
+                throw new IllegalArgumentException("Seat is outside the hall: " + seat);
+            }
+            result[offset++] = (seat.row() - 1) * hall.seatsPerRow() + seat.number() - 1;
         }
         Arrays.sort(result);
         return result;
@@ -263,41 +332,6 @@ public class BookingServiceImpl implements BookingService {
         }
         synchronized (states[indices[offset]]) {
             return withSeats(indices, offset + 1, action);
-        }
-    }
-
-    private void enter(Waiter waiter) {
-        synchronized (lifecycle) {
-            if (stopped) {
-                throw new IllegalStateException("Booking service is stopped");
-            }
-            activeCalls++;
-            if (waiter != null) {
-                waiters.add(waiter);
-            }
-        }
-    }
-
-    private void leave(Waiter waiter) {
-        synchronized (lifecycle) {
-            waiters.remove(waiter);
-            if (--activeCalls == 0) {
-                lifecycle.notifyAll();
-            }
-        }
-    }
-
-    private static long nanos(Duration duration) {
-        try {
-            return duration.toNanos();
-        } catch (ArithmeticException e) {
-            return Long.MAX_VALUE;
-        }
-    }
-
-    private static void timedWait(Object monitor, long nanos) throws InterruptedException {
-        if (nanos > 0) {
-            monitor.wait(nanos / 1_000_000, (int) (nanos % 1_000_000));
         }
     }
 
@@ -326,14 +360,6 @@ public class BookingServiceImpl implements BookingService {
                 return SeatStatus.SOLD;
             }
             return hold != null && now.isBefore(hold.expiresAt()) ? SeatStatus.HELD : SeatStatus.FREE;
-        }
-
-        private void signalWaiters() {
-            if (waiters != null) {
-                for (Waiter waiter : waiters) {
-                    waiter.signal();
-                }
-            }
         }
     }
 }
