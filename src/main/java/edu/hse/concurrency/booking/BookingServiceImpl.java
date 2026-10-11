@@ -33,11 +33,13 @@ public class BookingServiceImpl implements BookingService {
     public Optional<Hold> hold(String clientId, Set<Seat> seats) {
         Set<Seat> copy = Set.copyOf(Objects.requireNonNull(seats, "seats"));
         int[] indices = prepareSeats(clientId, copy);
+        long id;
         synchronized (lifecycle) {
             if (stopped) {
                 throw new IllegalStateException("Booking service is stopped");
             }
             activeCalls++;
+            id = ++nextId;
         }
         try {
             return withSeats(indices, 0, () -> {
@@ -47,7 +49,7 @@ public class BookingServiceImpl implements BookingService {
                         return Optional.empty();
                     }
                 }
-                return Optional.of(createHold(clientId, copy, indices, now));
+                return Optional.of(createHold(id, clientId, copy, indices, now));
             });
         } finally {
             synchronized (lifecycle) {
@@ -75,12 +77,14 @@ public class BookingServiceImpl implements BookingService {
             timeoutNanos = Long.MAX_VALUE;
         }
         final long budget = timeoutNanos;
+        long id;
         synchronized (lifecycle) {
             if (stopped) {
                 throw new IllegalStateException("Booking service is stopped");
             }
             activeCalls++;
             waiters.add(waiter);
+            id = ++nextId;
         }
         long started = System.nanoTime();
         try {
@@ -91,13 +95,13 @@ public class BookingServiceImpl implements BookingService {
                     synchronized (waiter) {
                         waiter.signalled = false;
                     }
+                    Instant now = Instant.now();
                     long checkedAt = System.nanoTime();
                     long remaining = budget - (checkedAt - started);
                     if (stopped || Thread.currentThread().isInterrupted()
                             || (remaining <= 0 && (!first || budget > 0))) {
                         return new Attempt(null, true, 0);
                     }
-                    Instant now = Instant.now();
                     boolean free = true;
                     long delay = Math.max(0, remaining);
                     for (int index : indices) {
@@ -121,7 +125,7 @@ public class BookingServiceImpl implements BookingService {
                         if (stopped || Thread.currentThread().isInterrupted()) {
                             return new Attempt(null, true, 0);
                         }
-                        return new Attempt(createHold(clientId, copy, indices, now), true, 0);
+                        return new Attempt(createHold(id, clientId, copy, indices, now), true, 0);
                     }
                     if (remaining <= 0) {
                         return new Attempt(null, true, 0);
@@ -135,7 +139,7 @@ public class BookingServiceImpl implements BookingService {
                     }
                     return new Attempt(null, false, checkedAt + delay);
                 });
-                // Once committed, an interrupt belongs to the caller's next operation.
+
                 if (attempt.hold != null) {
                     return Optional.of(attempt.hold);
                 }
@@ -291,16 +295,12 @@ public class BookingServiceImpl implements BookingService {
         }
     }
 
-    private Hold createHold(String clientId, Set<Seat> seats, int[] indices, Instant now) {
+    private Hold createHold(long id, String clientId, Set<Seat> seats, int[] indices, Instant now) {
         Instant expiresAt;
         try {
             expiresAt = now.plus(holdDuration);
         } catch (DateTimeException | ArithmeticException e) {
             expiresAt = Instant.MAX;
-        }
-        long id;
-        synchronized (lifecycle) {
-            id = ++nextId;
         }
         Hold hold = new Hold(id, clientId, seats, expiresAt);
         for (int index : indices) {
